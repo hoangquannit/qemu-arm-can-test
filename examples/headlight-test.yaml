@@ -1,0 +1,29 @@
+name: headlight-regression
+interface: vcan0
+timeout: 20s
+
+evidence:
+  - junit
+  - can-trace
+  - manifest
+
+cases:
+  - name: turn headlight on
+    request: "100#01"
+    expected: "101#01"
+    timeout: 1s
+
+  - name: turn headlight off
+    request: "100#00"
+    expected: "101#00"
+    timeout: 1s
+
+  - name: reject invalid payload
+    request: "100#FF"
+    expected: "1FF#01"
+    timeout: 1s
+
+  - name: ignore unrelated CAN ID
+    request: "200#01"
+    expectSilence: true
+    timeout: 300ms

@@ -1,0 +1,22 @@
+#!/bin/sh
+
+case "$1" in
+  start)
+    echo "Starting virtual body ECU"
+    ip link set can0 type can bitrate 500000
+    ip link set can0 up
+    start-stop-daemon -S -b -m -p /var/run/body-ecu.pid \
+      -x /usr/bin/body-ecu -- --interface can0
+    ;;
+  stop)
+    start-stop-daemon -K -p /var/run/body-ecu.pid
+    ;;
+  restart)
+    "$0" stop
+    "$0" start
+    ;;
+  *)
+    echo "Usage: $0 {start|stop|restart}"
+    exit 1
+    ;;
+esac

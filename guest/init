@@ -1,0 +1,42 @@
+#!/bin/busybox sh
+set -eu
+
+/bin/busybox mount -t proc proc /proc
+/bin/busybox mount -t sysfs sysfs /sys
+/bin/busybox mount -t devtmpfs devtmpfs /dev
+/bin/busybox --install -s
+
+for argument in $(cat /proc/cmdline); do
+  case "$argument" in
+    poc_epoch=*) date -u -s "@${argument#poc_epoch=}" >/dev/null 2>&1 || true ;;
+  esac
+done
+
+echo "GUEST_BOOTED machine=sabrelite arch=armv7"
+
+/usr/bin/can-up can0 500000
+/usr/bin/can-up can1 500000
+
+/usr/bin/body-ecu --interface can0 &
+ecu_pid=$!
+sleep 1
+
+set +e
+/usr/bin/testctl run --interface can1 --output /evidence /etc/headlight-test.yaml
+test_status=$?
+set -e
+
+kill "$ecu_pid" 2>/dev/null || true
+wait "$ecu_pid" 2>/dev/null || true
+
+echo "POC_EVIDENCE_BEGIN"
+tar -C /evidence -czf - . | base64
+echo "POC_EVIDENCE_END"
+
+if [ "$test_status" -eq 0 ]; then
+  echo "POC_RESULT=passed"
+else
+  echo "POC_RESULT=failed exit_code=$test_status"
+fi
+
+poweroff -f

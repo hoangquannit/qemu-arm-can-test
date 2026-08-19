@@ -1,0 +1,116 @@
+FROM golang:1.23-bookworm AS go-builder
+
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY cmd ./cmd
+COPY internal ./internal
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o /out/testctl ./cmd/testctl
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7 go build -trimpath -ldflags="-s -w" -o /out/body-ecu ./cmd/body-ecu
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7 go build -trimpath -ldflags="-s -w" -o /out/testctl-arm ./cmd/testctl
+
+FROM debian:bookworm AS guest-builder
+
+ARG LINUX_VERSION=6.6.147
+ARG BUILD_JOBS=8
+
+RUN dpkg --add-architecture armhf \
+    && apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      bc bison ca-certificates cpio curl dpkg-dev flex gcc gcc-arm-linux-gnueabihf \
+      libelf-dev libssl-dev make xz-utils \
+    && apt-get download busybox-static:armhf \
+    && mkdir -p /tmp/busybox-arm \
+    && dpkg-deb -x busybox-static_*_armhf.deb /tmp/busybox-arm \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /kernel
+RUN curl -fL "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-${LINUX_VERSION}.tar.xz" \
+      | tar -xJ --strip-components=1
+RUN make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- multi_v7_defconfig \
+    && scripts/config \
+      --enable BLK_DEV_INITRD \
+      --enable DEVTMPFS \
+      --enable DEVTMPFS_MOUNT \
+      --enable RD_GZIP \
+      --enable CAN \
+      --enable CAN_RAW \
+      --enable CAN_DEV \
+      --enable CAN_FLEXCAN \
+      --enable SERIAL_IMX \
+      --enable SERIAL_IMX_CONSOLE \
+    && make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- olddefconfig \
+    && make -j"${BUILD_JOBS}" ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- zImage dtbs
+
+COPY --from=go-builder /out/body-ecu /rootfs/usr/bin/body-ecu
+COPY --from=go-builder /out/testctl-arm /rootfs/usr/bin/testctl
+COPY examples/headlight-test.yaml /rootfs/etc/headlight-test.yaml
+COPY guest/init /rootfs/init
+RUN mkdir -p /rootfs/bin /rootfs/dev /rootfs/evidence /rootfs/proc /rootfs/sbin /rootfs/sys /rootfs/tmp /rootfs/usr/sbin /rootfs/var/run \
+    && cp /tmp/busybox-arm/bin/busybox /rootfs/bin/busybox \
+    && chmod 0755 /rootfs/init /rootfs/bin/busybox /rootfs/usr/bin/body-ecu /rootfs/usr/bin/testctl \
+    && cd /rootfs \
+    && find . -print0 | cpio --null -o --format=newc | gzip -9 > /rootfs.cpio.gz \
+    && cp /kernel/arch/arm/boot/zImage /zImage \
+    && cp /kernel/arch/arm/boot/dts/nxp/imx/imx6q-sabrelite.dtb /imx6q-sabrelite.dtb
+
+FROM guest-builder AS can-helper-builder
+
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libc6-dev-armhf-cross \
+    && rm -rf /var/lib/apt/lists/*
+COPY guest/can-up.c /tmp/can-up.c
+RUN arm-linux-gnueabihf-gcc -static -Os -s -o /can-up /tmp/can-up.c
+
+FROM guest-builder AS guest-image
+
+COPY --from=can-helper-builder /can-up /rootfs/usr/bin/can-up
+RUN chmod 0755 /rootfs/usr/bin/can-up \
+    && cd /rootfs \
+    && find . -print0 | cpio --null -o --format=newc | gzip -9 > /rootfs.cpio.gz
+
+FROM debian:bookworm-slim AS dtb-patcher
+
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends device-tree-compiler \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=guest-image /imx6q-sabrelite.dtb /imx6q-sabrelite.dtb
+RUN fdtput -t s /imx6q-sabrelite.dtb /soc/bus@2000000/can@2094000 status okay
+
+FROM debian:trixie AS qemu-builder
+
+ARG QEMU_COMMIT=fa19879df1658f96ac07365fca8835b7decd6995
+ARG BUILD_JOBS=8
+
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      bzip2 ca-certificates gcc git libglib2.0-dev libpixman-1-dev make meson ninja-build \
+      pkg-config python3 python3-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /qemu
+RUN git init \
+    && git remote add origin https://gitlab.com/qemu-project/qemu.git \
+    && git fetch --depth 1 origin "${QEMU_COMMIT}" \
+    && git checkout --detach FETCH_HEAD
+RUN ./configure --target-list=arm-softmmu --disable-docs --disable-werror \
+    && ninja -C build -j"${BUILD_JOBS}" qemu-system-arm
+
+FROM debian:trixie-slim AS poc
+
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      ca-certificates coreutils qemu-system-arm \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=go-builder /out/testctl /usr/local/bin/testctl
+COPY --from=qemu-builder /qemu/build/qemu-system-arm /usr/local/bin/qemu-system-arm
+COPY --from=guest-image /zImage /opt/poc/zImage
+COPY --from=dtb-patcher /imx6q-sabrelite.dtb /opt/poc/imx6q-sabrelite.dtb
+COPY --from=guest-image /rootfs.cpio.gz /opt/poc/rootfs.cpio.gz
+COPY examples/headlight-test.yaml /opt/poc/headlight-test.yaml
+COPY scripts/run-poc-container.sh /usr/local/bin/run-poc
+
+RUN chmod 0755 /usr/local/bin/testctl /usr/local/bin/run-poc
+
+ENTRYPOINT ["/usr/local/bin/run-poc"]
